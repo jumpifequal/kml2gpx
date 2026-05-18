@@ -20,11 +20,15 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#include <objbase.h>
+#include <shldisp.h>
 
 #include "third_party/tinyxml2/tinyxml2.h"
 
 #ifdef _MSC_VER
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 #endif
 
 struct Coordinate {
@@ -325,6 +329,24 @@ static std::wstring WidenAscii(const std::string& s) {
     return std::wstring(s.begin(), s.end());
 }
 
+static std::wstring WidenWindowsPath(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int needed = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
+    if (needed <= 0) return WidenAscii(s);
+
+    std::wstring out;
+    out.resize(static_cast<size_t>(needed - 1));
+    MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, &out[0], needed);
+    return out;
+}
+
+static bool HasExtension(const std::string& path, const char* ext) {
+    const std::string::size_type sep = path.find_last_of("/\\");
+    const std::string::size_type dot = path.rfind('.');
+    if (dot == std::string::npos || (sep != std::string::npos && dot < sep)) return false;
+    return ToLower(path.substr(dot)) == ext;
+}
+
 static std::string BuildElevationLocationsQuery(const std::vector<ElevationTarget>& batch) {
     std::ostringstream oss;
     for (size_t i = 0; i < batch.size(); ++i) {
@@ -338,7 +360,7 @@ static std::string BuildElevationLocationsQuery(const std::vector<ElevationTarge
 static bool HttpGetWinHttp(const std::string& pathAndQuery, std::string& response) {
     response.clear();
 
-    HINTERNET session = WinHttpOpen(L"kml2gpx/1.0",
+    HINTERNET session = WinHttpOpen(L"kml2gpx/1.1",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -619,15 +641,7 @@ static void ConvertPlacemark(const tinyxml2::XMLElement* placemark, ConversionRe
     }
 }
 
-static ConversionResult ReadKml(const std::string& inPath) {
-    tinyxml2::XMLDocument doc;
-    const tinyxml2::XMLError rc = doc.LoadFile(inPath.c_str());
-    if (rc != tinyxml2::XML_SUCCESS) {
-        std::ostringstream oss;
-        oss << "[kml] XML parse/load error code=" << rc;
-        throw std::runtime_error(oss.str());
-    }
-
+static ConversionResult ParseKmlDocument(tinyxml2::XMLDocument& doc) {
     const tinyxml2::XMLElement* root = doc.RootElement();
     if (!root) {
         throw std::runtime_error("[kml] Empty XML document");
@@ -646,6 +660,198 @@ static ConversionResult ReadKml(const std::string& inPath) {
         throw std::runtime_error("[kml] No supported Point, LineString, or gx:Track geometries found");
     }
     return result;
+}
+
+static ConversionResult ReadKml(const std::string& inPath) {
+    tinyxml2::XMLDocument doc;
+    const tinyxml2::XMLError rc = doc.LoadFile(inPath.c_str());
+    if (rc != tinyxml2::XML_SUCCESS) {
+        std::ostringstream oss;
+        oss << "[kml] XML parse/load error code=" << rc;
+        throw std::runtime_error(oss.str());
+    }
+    return ParseKmlDocument(doc);
+}
+
+static std::string JoinPath(const std::string& base, const std::string& name) {
+    if (base.empty()) return name;
+    const char last = base[base.size() - 1];
+    if (last == '\\' || last == '/') return base + name;
+    return base + "\\" + name;
+}
+
+static bool CreateTempDirectory(std::string& outDir) {
+    char tempPath[MAX_PATH] = {};
+    if (GetTempPathA(MAX_PATH, tempPath) == 0) return false;
+
+    char uniquePath[MAX_PATH] = {};
+    if (GetTempFileNameA(tempPath, "k2g", 0, uniquePath) == 0) return false;
+
+    DeleteFileA(uniquePath);
+    if (!CreateDirectoryA(uniquePath, nullptr)) return false;
+    outDir = uniquePath;
+    return true;
+}
+
+static void DeleteTree(const std::string& path) {
+    WIN32_FIND_DATAA data = {};
+    HANDLE find = FindFirstFileA(JoinPath(path, "*").c_str(), &data);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            const std::string name = data.cFileName;
+            if (name == "." || name == "..") continue;
+
+            const std::string child = JoinPath(path, name);
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                DeleteTree(child);
+            }
+            else {
+                SetFileAttributesA(child.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileA(child.c_str());
+            }
+        } while (FindNextFileA(find, &data));
+        FindClose(find);
+    }
+    RemoveDirectoryA(path.c_str());
+}
+
+static bool FindFirstKmlFile(const std::string& dir, std::string& outPath) {
+    WIN32_FIND_DATAA data = {};
+    HANDLE find = FindFirstFileA(JoinPath(dir, "*").c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return false;
+
+    std::vector<std::string> subdirs;
+    do {
+        const std::string name = data.cFileName;
+        if (name == "." || name == "..") continue;
+
+        const std::string child = JoinPath(dir, name);
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            subdirs.push_back(child);
+        }
+        else if (HasExtension(child, ".kml") &&
+                 (data.nFileSizeHigh != 0 || data.nFileSizeLow != 0)) {
+            outPath = child;
+            FindClose(find);
+            return true;
+        }
+    } while (FindNextFileA(find, &data));
+    FindClose(find);
+
+    for (const std::string& subdir : subdirs) {
+        if (FindFirstKmlFile(subdir, outPath)) return true;
+    }
+    return false;
+}
+
+static void VariantFromPath(const std::string& path, VARIANT& v) {
+    VariantInit(&v);
+    v.vt = VT_BSTR;
+    v.bstrVal = SysAllocString(WidenWindowsPath(path).c_str());
+}
+
+static std::string ExtractKmlFromKmz(const std::string& kmzPath, std::string& tempDir) {
+    if (!CreateTempDirectory(tempDir)) {
+        throw std::runtime_error("[kmz] Could not create temporary extraction directory");
+    }
+
+    const std::string zipPath = JoinPath(tempDir, "source.zip");
+    const std::string extractDir = JoinPath(tempDir, "extracted");
+    if (!CreateDirectoryA(extractDir.c_str(), nullptr)) {
+        throw std::runtime_error("[kmz] Could not create extraction target directory");
+    }
+    if (!CopyFileA(kmzPath.c_str(), zipPath.c_str(), FALSE)) {
+        throw std::runtime_error("[kmz] Could not copy KMZ to temporary ZIP file");
+    }
+
+    const HRESULT coinit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool uninitCom = SUCCEEDED(coinit);
+    if (FAILED(coinit) && coinit != RPC_E_CHANGED_MODE) {
+        throw std::runtime_error("[kmz] Could not initialize Windows ZIP support");
+    }
+
+    IShellDispatch* shell = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_Shell, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&shell));
+    if (FAILED(hr) || !shell) {
+        if (uninitCom) CoUninitialize();
+        throw std::runtime_error("[kmz] Could not create Windows Shell ZIP handler");
+    }
+
+    VARIANT zipVariant;
+    VARIANT destVariant;
+    VariantFromPath(zipPath, zipVariant);
+    VariantFromPath(extractDir, destVariant);
+
+    Folder* zipFolder = nullptr;
+    Folder* destFolder = nullptr;
+    hr = shell->NameSpace(zipVariant, &zipFolder);
+    if (SUCCEEDED(hr)) hr = shell->NameSpace(destVariant, &destFolder);
+
+    VariantClear(&zipVariant);
+    VariantClear(&destVariant);
+
+    if (FAILED(hr) || !zipFolder || !destFolder) {
+        if (zipFolder) zipFolder->Release();
+        if (destFolder) destFolder->Release();
+        shell->Release();
+        if (uninitCom) CoUninitialize();
+        throw std::runtime_error("[kmz] Could not open KMZ archive");
+    }
+
+    FolderItems* zipItems = nullptr;
+    hr = zipFolder->Items(&zipItems);
+    if (FAILED(hr) || !zipItems) {
+        zipFolder->Release();
+        destFolder->Release();
+        shell->Release();
+        if (uninitCom) CoUninitialize();
+        throw std::runtime_error("[kmz] Could not enumerate KMZ archive");
+    }
+
+    VARIANT itemVariant;
+    VariantInit(&itemVariant);
+    itemVariant.vt = VT_DISPATCH;
+    itemVariant.pdispVal = zipItems;
+
+    VARIANT optionsVariant;
+    VariantInit(&optionsVariant);
+    optionsVariant.vt = VT_I4;
+    optionsVariant.lVal = 4 | 16 | 1024;
+
+    hr = destFolder->CopyHere(itemVariant, optionsVariant);
+    zipItems->Release();
+    zipFolder->Release();
+    destFolder->Release();
+    shell->Release();
+    if (uninitCom) CoUninitialize();
+
+    if (FAILED(hr)) {
+        throw std::runtime_error("[kmz] Could not extract KMZ archive");
+    }
+
+    std::string kmlPath;
+    for (int i = 0; i < 120; ++i) {
+        if (FindFirstKmlFile(extractDir, kmlPath)) return kmlPath;
+        Sleep(250);
+    }
+
+    throw std::runtime_error("[kmz] No KML file found inside KMZ archive");
+}
+
+static ConversionResult ReadInput(const std::string& inPath) {
+    if (!HasExtension(inPath, ".kmz")) return ReadKml(inPath);
+
+    std::string tempDir;
+    try {
+        const std::string kmlPath = ExtractKmlFromKmz(inPath, tempDir);
+        ConversionResult result = ReadKml(kmlPath);
+        DeleteTree(tempDir);
+        return result;
+    }
+    catch (...) {
+        if (!tempDir.empty()) DeleteTree(tempDir);
+        throw;
+    }
 }
 
 static void AddTextElement(tinyxml2::XMLDocument& doc,
@@ -728,9 +934,9 @@ static bool WriteGpx(const std::string& outPath, const ConversionResult& data) {
 
 static void ShowHelp(const char* exe) {
     std::cout <<
-        "KML -> GPX converter\n\n"
+        "KML/KMZ -> GPX converter\n\n"
         "Usage:\n"
-        "  " << exe << " <input.kml> [output.gpx] [options]\n\n"
+        "  " << exe << " <input.kml|input.kmz> [output.gpx] [options]\n\n"
         "If [output.gpx] is omitted, it will be set automatically to <input>.gpx\n\n"
         "Options:\n"
         "  --do-not-fetch-elevation          Do not call OpenTopoData for missing elevations\n"
@@ -758,6 +964,7 @@ static void ShowHelp(const char* exe) {
         "  are copied to GPX track point time/elevation, with speed derived when possible.\n\n"
         "Examples:\n"
         "  " << exe << " route.kml\n"
+        "  " << exe << " route.kmz\n"
         "  " << exe << " route.kml route.gpx\n";
 }
 
@@ -771,7 +978,7 @@ static bool ParseArgs(int argc, char** argv, Args& a) {
         std::string s = argv[i];
 
         if (s == "--version" || s == "-v") {
-            std::cout << "kml2gpx 1.0.0\n";
+            std::cout << "kml2gpx 1.1\n";
             std::exit(0);
         }
         if (s == "-h" || s == "--help") {
@@ -857,7 +1064,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-        ConversionResult data = ReadKml(args.kmlFile);
+        ConversionResult data = ReadInput(args.kmlFile);
         std::cout << "[kml] Waypoints: " << data.waypoints.size() << "\n";
         std::cout << "[kml] Tracks: " << data.tracks.size() << "\n";
 
